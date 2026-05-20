@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Project
+.env
+.env.local
+NEXT_SESSION.md
+*.log
+
+# Audio scratch
+/var/tmp/yt-transcript/
+tmp/
+*.m4a
+*.webm
+*.mp3
+*.wav
+
+# Alembic auto-revisions in dev
+# alembic/versions/*_*.py is kept under VC; this guards local junk
+*.bak
