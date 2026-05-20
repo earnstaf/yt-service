@@ -1,0 +1,28 @@
+[Unit]
+Description=YT Transcript Service — RQ worker (default queue)
+After=redis.service network.target
+Wants=redis.service
+
+[Service]
+Type=simple
+User=yttranscript
+Group=yttranscript
+WorkingDirectory=/opt/yt-transcript/src
+EnvironmentFile=/opt/yt-transcript/.env
+# --with-scheduler enables RQ's built-in scheduler thread so delayed jobs
+# (Queue.enqueue_in) actually fire. Webhook retries depend on this — see
+# app/webhooks.py _enqueue_with_delay. Without it, retry tasks sit in
+# Redis indefinitely after their delay elapses (H6).
+ExecStart=/opt/yt-transcript/venv/bin/rq worker --with-scheduler --url ${REDIS_URL} default
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/yt-transcript /var/tmp/yt-transcript
+
+[Install]
+WantedBy=multi-user.target

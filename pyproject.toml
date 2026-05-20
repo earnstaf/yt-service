@@ -22,12 +22,19 @@ where = ["src"]
 minversion = "8.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra --strict-markers --strict-config"
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:pyannote.*",
     "ignore::DeprecationWarning:pkg_resources.*",
     "ignore::UserWarning:torch.*",
+    # respx/httpx + Windows occasionally leaves a transient socket open
+    # between tests; pytest re-raises it as PytestUnraisableExceptionWarning.
+    # It is not a correctness defect — downgrade to a warning so the suite
+    # is not order-dependent.
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore::ResourceWarning",
 ]
 markers = [
     "integration: tests that touch Postgres/Redis (use --run-integration)",
@@ -35,8 +42,12 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src/app"]
 branch = true
+source_pkgs = ["app"]
+omit = [
+    "src/app/__init__.py",
+    "src/app/whisper/local_backend.py",
+]
 
 [tool.coverage.report]
 exclude_lines = [

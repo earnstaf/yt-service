@@ -1,0 +1,27 @@
+[Unit]
+Description=YT Transcript Service — RQ worker (enrichment queue, P2+)
+After=redis.service postgresql.service network.target
+Wants=redis.service postgresql.service
+
+[Service]
+# The enrichment queue is empty in P1. This unit is shipped now so that
+# future redeploys (P2 diarization, sentiment, embeddings) do not require
+# a structural change to the systemd layout — only an `enable + start`.
+Type=simple
+User=yttranscript
+Group=yttranscript
+WorkingDirectory=/opt/yt-transcript/src
+EnvironmentFile=/opt/yt-transcript/.env
+ExecStart=/opt/yt-transcript/venv/bin/rq worker --url ${REDIS_URL} enrichment
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/yt-transcript /var/tmp/yt-transcript
+
+[Install]
+WantedBy=multi-user.target

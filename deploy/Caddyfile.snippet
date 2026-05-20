@@ -1,0 +1,28 @@
+# yt-transcript-service — Caddy site block.
+#
+# This is a SITE STANZA only. Append it to the existing /etc/caddy/Caddyfile
+# (the same one used by SE Job Scraper on this VPS). Do not include a global
+# block here — Caddy already has one.
+#
+# TLS: Caddy will auto-issue and auto-renew a Let's Encrypt certificate for
+# yt.ericmax.com on first start. Make sure the DNS A record resolves to the
+# VPS public IP before reloading Caddy.
+#
+# /metrics is locked down at the proxy layer to loopback only (defense in
+# depth). The app ALSO enforces this in middleware. Both must agree.
+yt.ericmax.com {
+    encode zstd gzip
+
+    @metrics path /metrics
+    handle @metrics {
+        @local remote_ip 127.0.0.1/32 ::1/128
+        handle @local {
+            reverse_proxy 127.0.0.1:8765
+        }
+        respond "Forbidden" 403
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:8765
+    }
+}

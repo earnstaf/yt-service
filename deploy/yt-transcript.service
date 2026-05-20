@@ -1,0 +1,24 @@
+[Unit]
+Description=YT Transcript Service — FastAPI API
+After=postgresql.service redis.service network.target
+Wants=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=yttranscript
+Group=yttranscript
+WorkingDirectory=/opt/yt-transcript/src
+EnvironmentFile=/opt/yt-transcript/.env
+ExecStart=/opt/yt-transcript/venv/bin/uvicorn app.main:app --host ${YT_BIND_HOST} --port ${YT_BIND_PORT} --workers 2 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/yt-transcript /var/tmp/yt-transcript
+
+[Install]
+WantedBy=multi-user.target

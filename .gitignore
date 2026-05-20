@@ -47,3 +47,4 @@ tmp/
 # Alembic auto-revisions in dev
 # alembic/versions/*_*.py is kept under VC; this guards local junk
 *.bak
+.claude/

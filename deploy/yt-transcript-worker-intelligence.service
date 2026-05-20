@@ -1,0 +1,27 @@
+[Unit]
+Description=YT Transcript Service — RQ worker (intelligence queue, P4+)
+After=redis.service postgresql.service network.target
+Wants=redis.service postgresql.service
+
+[Service]
+# The intelligence queue is empty in P1. This unit lands now so that the
+# P4 monitor/intelligence work can be enabled atomically with no further
+# systemd unit changes — just populate the queue and `systemctl enable`.
+Type=simple
+User=yttranscript
+Group=yttranscript
+WorkingDirectory=/opt/yt-transcript/src
+EnvironmentFile=/opt/yt-transcript/.env
+ExecStart=/opt/yt-transcript/venv/bin/rq worker --url ${REDIS_URL} intelligence
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/yt-transcript /var/tmp/yt-transcript
+
+[Install]
+WantedBy=multi-user.target

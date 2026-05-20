@@ -1,0 +1,41 @@
+# yt-transcript-service — nginx site block.
+#
+# Use this if the VPS runs nginx instead of Caddy. Caddy is the preferred
+# reverse proxy on this VPS (see Caddyfile.snippet); this file is provided
+# as a fallback for environments where nginx is already configured.
+#
+# Steps:
+#   1. Copy to /etc/nginx/sites-available/yt-transcript.conf
+#   2. Symlink into /etc/nginx/sites-enabled/
+#   3. Issue a cert with: certbot --nginx -d yt.ericmax.com
+#   4. sudo systemctl reload nginx
+#
+# /metrics is locked down at the proxy layer to loopback only (defense in
+# depth). The app ALSO enforces this in middleware. Both must agree.
+
+server {
+    listen 443 ssl http2;
+    server_name yt.ericmax.com;
+
+    # TLS certificate paths assumed to be issued externally (e.g. certbot).
+    ssl_certificate     /etc/letsencrypt/live/yt.ericmax.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yt.ericmax.com/privkey.pem;
+
+    location /metrics {
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+        proxy_pass http://127.0.0.1:8765;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        client_max_body_size 50M;
+        proxy_read_timeout 300s;
+    }
+}

@@ -1,0 +1,30 @@
+[Unit]
+Description=YT Transcript Service — RQ worker (whisper queue)
+After=redis.service postgresql.service network.target
+Wants=redis.service postgresql.service
+
+[Service]
+# Concurrency note: rq worker is single-threaded by default. The whisper
+# queue intentionally uses one worker per unit to bound concurrent audio
+# downloads + transcription jobs (CPU, disk, and OpenAI rate limits).
+# To scale horizontally, copy this unit to
+#   yt-transcript-worker-whisper@.service
+# as a templated instance, or add yt-transcript-worker-whisper-2.service.
+Type=simple
+User=yttranscript
+Group=yttranscript
+WorkingDirectory=/opt/yt-transcript/src
+EnvironmentFile=/opt/yt-transcript/.env
+ExecStart=/opt/yt-transcript/venv/bin/rq worker --url ${REDIS_URL} whisper
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/yt-transcript /var/tmp/yt-transcript
+
+[Install]
+WantedBy=multi-user.target
