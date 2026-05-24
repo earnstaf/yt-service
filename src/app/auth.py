@@ -129,14 +129,27 @@ async def lookup_token(session: AsyncSession, plain: str) -> Token | None:
     rows = (await session.execute(stmt)).scalars().all()
     for row in rows:
         if verify_token_hash(row.token_hash, plain):
-            # Update last_used_at and persist. We commit immediately to make
-            # the timestamp durable independent of the request outcome.
-            from sqlalchemy import func as _func  # local import: avoid module-level churn
+            # Snapshot the attributes we'll need downstream BEFORE any commit.
+            # Commits expire ORM attributes by default; subsequent calls (rate
+            # limit middleware, route handlers) that re-access ``token.id`` or
+            # ``token.scopes`` would otherwise hit a DetachedInstanceError if
+            # the request's session has already been closed by the dependency
+            # generator. Holding the snapshot decouples lifetime.
+            from types import SimpleNamespace  # noqa: PLC0415
+
+            snapshot = SimpleNamespace(
+                id=row.id,
+                name=row.name,
+                scopes=list(row.scopes or []),
+                webhook_secret=row.webhook_secret,
+                rate_overrides=dict(row.rate_overrides or {}),
+            )
+
+            from sqlalchemy import func as _func  # noqa: PLC0415
 
             row.last_used_at = _func.now()  # type: ignore[assignment]
             await session.commit()
-            await session.refresh(row)
-            return row
+            return snapshot  # type: ignore[return-value]
     return None
 
 
