@@ -237,15 +237,15 @@ async def bootstrap_admin_token(session: AsyncSession) -> str | None:
             is_pg = False
 
     try:
-        # Check for any existing admin token. ARRAY contains operator covers it
-        # cleanly on Postgres and falls back to a Python-side scan elsewhere.
-        stmt = select(Token).where(
-            Token.revoked_at.is_(None),
-            Token.scopes.contains(["admin"]),
-        )
-        existing = (await session.execute(stmt)).scalars().first()
-        if existing is not None:
-            return None
+        # Check for any existing admin token. We avoid SQLAlchemy's generic-
+        # ARRAY ``contains`` (raises on Postgres: "@> not implemented for the
+        # base ARRAY type") by doing the membership check Python-side. Single-
+        # org service, <100 tokens at steady state, so O(N) is fine.
+        stmt = select(Token).where(Token.revoked_at.is_(None))
+        all_tokens = (await session.execute(stmt)).scalars().all()
+        for tok in all_tokens:
+            if "admin" in (tok.scopes or []):
+                return None
 
         token_id = make_token_id()
         row = Token(
