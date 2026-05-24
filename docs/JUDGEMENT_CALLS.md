@@ -238,6 +238,16 @@ Format: each entry is a short heading, the decision, the alternative considered,
 - **Alternative:** Reserve override to summarize only.
 - **Rationale:** Spec §12 P4 acceptance includes "`provider_override` works for admin-scope tokens" — that bullet is unreachable without the field on all three intelligence endpoints. Topics and diff also bypass cache when override is set (JC-041 pattern).
 
+### JC-049 — Zyte API in proxy mode requires the Zyte CA on the system trust path
+- **Decision:** Production VPS sets `YT_HTTPS_PROXY=http://<ZYTE_API_KEY>:@api.zyte.com:8011` AND installs Zyte's CA (`/usr/local/share/ca-certificates/zyte-ca.crt`) AND points `REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt` in `/opt/yt-transcript/.env`. Without the CA + bundle, `requests` (used by youtube-transcript-api) rejects the proxy's MITM intercept.
+- **Alternative:** Zyte SPM (the proxy product, distinct from Zyte API). Cleaner; doesn't require trust-bundle juggling. But user only has Zyte API billing.
+- **Rationale:** Per JC-002 Zyte API isn't a drop-in for the captions library. The proxy-mode workaround bridges the gap. Documented in `deploy/README.md` Troubleshooting section.
+
+### JC-050 — Service hardening: PrivateTmp=false on the VPS
+- **Decision:** All six systemd units have `PrivateTmp=false` (was `true` in the committed unit files). With `ProtectSystem=strict` + `ReadWritePaths=/var/tmp/yt-transcript`, PrivateTmp creates a separate namespace that fails to mount `/var/tmp/yt-transcript`.
+- **Alternative:** Move `YTDLP_TMP_DIR` to `/opt/yt-transcript/tmp` (under ReadWritePaths).
+- **Rationale:** Quick fix to unblock deploy. Moving the tmp dir requires re-checking every yt-dlp/Whisper code path. Will revisit and ship a proper fix once the service is running smoothly.
+
 ### JC-038 — Diarization audio is re-downloaded (no pass-through from Whisper)
 - **Decision:** Each diarization job downloads audio fresh via yt-dlp. No coordination with the Whisper job.
 - **Alternative:** Chain Whisper → diarization with audio path pass-through (delete-on-last-consumer pattern).
