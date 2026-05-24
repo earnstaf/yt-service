@@ -425,6 +425,95 @@ class SummarizeResponse(BaseModel):
     cached: bool
 
 
+# ---------------------------------------------------------------------------
+# /v1/topics (P4)
+# ---------------------------------------------------------------------------
+
+
+class TopicsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    refresh: bool = False
+    # Admin-only — the route enforces admin scope when set.
+    provider_override: str | None = Field(default=None, pattern=_PROVIDER_OVERRIDE_RE)
+
+
+class TopicsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    topics: list[str]
+    entities: dict[str, list[str]]
+    claims: list[dict[str, Any]]
+    questions_raised: list[str]
+    provider_used: str
+    cached: bool
+
+
+# ---------------------------------------------------------------------------
+# /v1/sentiment (P4)
+# ---------------------------------------------------------------------------
+
+
+class SentimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    granularity: Literal["overall", "chapter", "snippet"] = "chapter"
+
+
+class SentimentTimelineEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: float
+    end: float
+    score: float
+    label: Literal["negative", "neutral", "positive"]
+
+
+class SentimentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    granularity: str
+    overall: dict[str, Any]
+    timeline: list[SentimentTimelineEntry]
+    provider_used: str
+
+
+# ---------------------------------------------------------------------------
+# /v1/diff (P4)
+# ---------------------------------------------------------------------------
+
+
+class DiffRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_a: str
+    video_b: str
+    focus: Literal["topics_and_emphasis", "exact_changes", "competitive_positioning"] = (
+        "topics_and_emphasis"
+    )
+    # Admin-only — the route enforces admin scope when set.
+    provider_override: str | None = Field(default=None, pattern=_PROVIDER_OVERRIDE_RE)
+
+
+class DiffResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_a: str
+    video_b: str
+    focus: str
+    added_in_b: list[dict[str, Any]]
+    removed_from_a: list[dict[str, Any]]
+    shifted_emphasis: list[dict[str, Any]]
+    key_quotes_a: list[str]
+    key_quotes_b: list[str]
+    executive_summary: str
+    provider_used: str
+
+
 __all__ = [
     "TranscriptSnippetOut",
     "ChapterOut",
@@ -446,4 +535,11 @@ __all__ = [
     "IngestVideoOutcomeOut",
     "MonitorCreateRequest",
     "MonitorResponse",
+    "TopicsRequest",
+    "TopicsResponse",
+    "SentimentRequest",
+    "SentimentResponse",
+    "SentimentTimelineEntry",
+    "DiffRequest",
+    "DiffResponse",
 ]

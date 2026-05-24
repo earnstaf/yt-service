@@ -39,7 +39,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import cache, chapters as chapters_mod, ingest as ingest_mod, jobs, monitors as monitors_mod, serialization, transcript_service
 from app.parsing import parse_channel_or_playlist
+from app.tasks import diff as diff_task
+from app.tasks import sentiment as sentiment_task
 from app.tasks import summarize as summarize_task
+from app.tasks import topics as topics_task
 from app.auth import bootstrap_admin_token, require_scopes
 from app.config import get_settings
 from app.db import check_db_health, close_db, get_session, get_session_factory
@@ -73,8 +76,14 @@ from app.schemas import (
     JobStatusResponse,
     MonitorCreateRequest,
     MonitorResponse,
+    DiffRequest,
+    DiffResponse,
+    SentimentRequest,
+    SentimentResponse,
     SummarizeRequest,
     SummarizeResponse,
+    TopicsRequest,
+    TopicsResponse,
     TranscriptResponse,
     TranscriptSnippetOut,
 )
@@ -797,6 +806,102 @@ def _build_v1_router() -> APIRouter:
         await enforce_rate_limit("read", request, redis_client)
         rows = await monitors_mod.list_monitors(session, include_paused=False)
         return [_monitor_to_response(m) for m in rows]
+
+    # -----------------------------------------------------------------------
+    # P4: /v1/topics, /v1/sentiment, /v1/diff
+    # -----------------------------------------------------------------------
+
+    @router.post("/topics", response_model=TopicsResponse)
+    async def post_topics(
+        body: TopicsRequest,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("intelligence")),
+    ) -> TopicsResponse:
+        """Extract topics + entities + claims from a cached transcript (P4)."""
+        await enforce_rate_limit("intelligence", request, redis_client)
+        if body.provider_override is not None:
+            if "admin" not in (getattr(token, "scopes", None) or []):
+                raise InsufficientScopeError("provider_override requires admin scope")
+        parsed = parse_video_id(body.video_id)
+        result = await topics_task.extract_topics(
+            session,
+            video_id=parsed,
+            refresh=body.refresh,
+            token_id=getattr(token, "id", None),
+            provider_override=body.provider_override,
+        )
+        return TopicsResponse(
+            video_id=result.video_id,
+            topics=result.topics,
+            entities=result.entities,
+            claims=result.claims,
+            questions_raised=result.questions_raised,
+            provider_used=result.provider_used,
+            cached=result.cached,
+        )
+
+    @router.post("/sentiment", response_model=SentimentResponse)
+    async def post_sentiment(
+        body: SentimentRequest,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("intelligence")),
+    ) -> SentimentResponse:
+        """Compute sentiment timeline. Feature-flagged (JC-003 has it on)."""
+        await enforce_rate_limit("intelligence", request, redis_client)
+        parsed = parse_video_id(body.video_id)
+        result = await sentiment_task.compute_sentiment(
+            session,
+            video_id=parsed,
+            granularity=body.granularity,
+            token_id=getattr(token, "id", None),
+        )
+        return SentimentResponse(
+            video_id=result.video_id,
+            granularity=result.granularity,
+            overall={"score": result.overall_score, "label": result.overall_label},
+            timeline=result.timeline,
+            provider_used=result.provider_used,
+        )
+
+    @router.post("/diff", response_model=DiffResponse)
+    async def post_diff(
+        body: DiffRequest,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("intelligence")),
+    ) -> DiffResponse:
+        """Compare two cached transcripts. Both must be already cached (P4)."""
+        await enforce_rate_limit("intelligence", request, redis_client)
+        if body.provider_override is not None:
+            if "admin" not in (getattr(token, "scopes", None) or []):
+                raise InsufficientScopeError("provider_override requires admin scope")
+        a = parse_video_id(body.video_a)
+        b = parse_video_id(body.video_b)
+        result = await diff_task.diff_transcripts(
+            session,
+            video_a=a,
+            video_b=b,
+            focus=body.focus,
+            token_id=getattr(token, "id", None),
+            provider_override=body.provider_override,
+        )
+        return DiffResponse(
+            video_a=result.video_a,
+            video_b=result.video_b,
+            focus=result.focus,
+            added_in_b=result.added_in_b,
+            removed_from_a=result.removed_from_a,
+            shifted_emphasis=result.shifted_emphasis,
+            key_quotes_a=result.key_quotes_a,
+            key_quotes_b=result.key_quotes_b,
+            executive_summary=result.executive_summary,
+            provider_used=result.provider_used,
+        )
 
     @router.delete("/monitors/{monitor_id}", response_model=None, status_code=204)
     async def delete_monitor_route(

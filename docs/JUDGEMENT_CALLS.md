@@ -228,6 +228,16 @@ Format: each entry is a short heading, the decision, the alternative considered,
 - **Alternative:** Scheduler fires `monitor.new_video` synchronously regardless of outcome (the codex-reviewed original — which leaked queued-but-not-yet-transcribed events as if they were complete).
 - **Rationale:** Spec §7.9: "On completion of each new video, fire monitor's callback_url with the full result." That contract is only honored when the callback fires after completion, not after enqueue.
 
+### JC-047 — Chapter-granularity sentiment requires chapters; refuses fallback
+- **Decision:** `sentiment.compute_sentiment(..., granularity="chapter")` raises `NotFoundError` when no chapters are cached for the video, instructing the caller to request `/v1/transcript?v=<id>&include=chapters` first.
+- **Alternative:** Fall back to a single whole-video segment (the original implementation), persisted under the `(video_id, "chapter")` cache key.
+- **Rationale:** Codex flagged that the fallback poisoned the chapter cache — a later call after chapters land would return the stale one-segment result. Hard error is the right surface; client retries trivially after computing chapters.
+
+### JC-048 — P4 intelligence endpoints support `provider_override` (admin-only)
+- **Decision:** `/v1/topics` and `/v1/diff` accept `provider_override` body field. Schema validates the regex; route enforces admin scope inline. Same pattern as `/v1/summarize` (JC-037).
+- **Alternative:** Reserve override to summarize only.
+- **Rationale:** Spec §12 P4 acceptance includes "`provider_override` works for admin-scope tokens" — that bullet is unreachable without the field on all three intelligence endpoints. Topics and diff also bypass cache when override is set (JC-041 pattern).
+
 ### JC-038 — Diarization audio is re-downloaded (no pass-through from Whisper)
 - **Decision:** Each diarization job downloads audio fresh via yt-dlp. No coordination with the Whisper job.
 - **Alternative:** Chain Whisper → diarization with audio path pass-through (delete-on-last-consumer pattern).
