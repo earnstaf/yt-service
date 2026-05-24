@@ -37,7 +37,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import cache, chapters as chapters_mod, jobs, serialization, transcript_service
+from app import cache, chapters as chapters_mod, ingest as ingest_mod, jobs, monitors as monitors_mod, serialization, transcript_service
+from app.parsing import parse_channel_or_playlist
 from app.tasks import summarize as summarize_task
 from app.auth import bootstrap_admin_token, require_scopes
 from app.config import get_settings
@@ -65,8 +66,13 @@ from app.schemas import (
     CacheStatsResponse,
     ErrorEnvelope,
     HealthResponse,
+    IngestRequest,
+    IngestResponse,
+    IngestVideoOutcomeOut,
     JobAcceptedResponse,
     JobStatusResponse,
+    MonitorCreateRequest,
+    MonitorResponse,
     SummarizeRequest,
     SummarizeResponse,
     TranscriptResponse,
@@ -221,6 +227,24 @@ def _parse_include(raw: str | None) -> list[str]:
     if not raw:
         return []
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _monitor_to_response(monitor) -> MonitorResponse:  # noqa: ANN001 — ORM Monitor
+    """Map a Monitor ORM row to the wire response."""
+    return MonitorResponse(
+        id=monitor.id,
+        channel_id=monitor.channel_id,
+        channel_url=monitor.channel_url,
+        poll_interval_minutes=monitor.poll_interval_minutes,
+        include=list(monitor.include_jsonb or []),
+        callback_url=monitor.callback_url,
+        notes=monitor.notes,
+        last_polled_at=monitor.last_polled_at,
+        last_video_id=monitor.last_video_id,
+        created_by=monitor.created_by,
+        created_at=monitor.created_at,
+        paused=monitor.paused,
+    )
 
 
 async def _merge_chapters(
@@ -657,6 +681,134 @@ def _build_v1_router() -> APIRouter:
             cost_usd=float(result.cost_usd),
             cached=result.cached,
         )
+
+    # -----------------------------------------------------------------------
+    # P3: /v1/ingest and /v1/monitors
+    # -----------------------------------------------------------------------
+
+    @router.post("/ingest", response_model=IngestResponse)
+    async def post_ingest(
+        body: IngestRequest,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("batch")),
+    ) -> IngestResponse:
+        """Expand a channel/playlist URL into per-video transcript dispatch (P3 B1)."""
+        from datetime import date as _date
+
+        await enforce_rate_limit("batch", request, redis_client)
+        since: _date | None = None
+        if body.since:
+            try:
+                y, m, d = body.since.split("-")
+                since = _date(int(y), int(m), int(d))
+            except (ValueError, TypeError) as exc:
+                from app.exceptions import InvalidRequestError
+
+                raise InvalidRequestError(f"since must be YYYY-MM-DD: {body.since!r}") from exc
+
+        if body.callback_url:
+            from app.url_safety import validate_callback_url
+
+            validate_callback_url(body.callback_url)
+
+        async def _whisper_rate_limit() -> None:
+            await enforce_rate_limit("whisper", request, redis_client)
+
+        result = await ingest_mod.ingest_channel_or_playlist(
+            session,
+            redis_client,
+            url=body.url,
+            max_videos=body.max_videos,
+            since=since,
+            include=body.include,
+            callback_url=body.callback_url,
+            token_id=getattr(token, "id", ""),
+            whisper_rate_limit_hook=_whisper_rate_limit,
+        )
+        return IngestResponse(
+            ingest_id=result.ingest_id,
+            source=result.source,
+            video_count=result.video_count,
+            videos=[
+                IngestVideoOutcomeOut(
+                    video_id=v.video_id,
+                    status=v.status,
+                    job_id=v.job_id,
+                    error=v.error,
+                )
+                for v in result.videos
+            ],
+        )
+
+    @router.post("/monitors", response_model=MonitorResponse)
+    async def post_monitor(
+        body: MonitorCreateRequest,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("monitor")),
+    ) -> MonitorResponse:
+        """Register a channel/playlist for scheduled polling (P3 C1)."""
+        await enforce_rate_limit("monitor_create", request, redis_client)
+        ref = parse_channel_or_playlist(body.channel_url)
+        if ref.kind == "playlist":
+            from app.exceptions import InvalidRequestError
+
+            raise InvalidRequestError("monitors track channels, not playlists; pass a channel url")
+        from app.url_safety import validate_callback_url
+        from app.youtube import resolve_channel_id
+
+        validate_callback_url(body.callback_url)
+
+        # YouTube's RSS feed requires a UC... channel ID. Resolve handles now
+        # so the scheduler never holds a non-canonical id (codex H1 fix).
+        if ref.kind == "channel_id":
+            channel_id = ref.value
+        else:
+            channel_id = await resolve_channel_id(ref)
+            if not channel_id:
+                from app.exceptions import InvalidChannelError
+
+                raise InvalidChannelError(
+                    f"could not resolve channel ID for {body.channel_url!r}"
+                )
+
+        monitor = await monitors_mod.create_monitor(
+            session,
+            channel_id=channel_id,
+            channel_url=body.channel_url,
+            poll_interval_minutes=body.poll_interval_minutes,
+            include=body.include,
+            callback_url=body.callback_url,
+            notes=body.notes,
+            created_by=getattr(token, "id", ""),
+        )
+        return _monitor_to_response(monitor)
+
+    @router.get("/monitors", response_model=list[MonitorResponse])
+    async def list_monitors_route(
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("read")),  # noqa: ARG001
+    ) -> list[MonitorResponse]:
+        await enforce_rate_limit("read", request, redis_client)
+        rows = await monitors_mod.list_monitors(session, include_paused=False)
+        return [_monitor_to_response(m) for m in rows]
+
+    @router.delete("/monitors/{monitor_id}", response_model=None, status_code=204)
+    async def delete_monitor_route(
+        monitor_id: str,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("monitor")),  # noqa: ARG001
+    ) -> Response:
+        await enforce_rate_limit("monitor_create", request, redis_client)
+        await monitors_mod.delete_monitor(session, monitor_id)
+        return Response(status_code=204)
 
     return router
 

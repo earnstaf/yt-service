@@ -1,0 +1,28 @@
+[Unit]
+Description=YT Transcript Service — channel monitor scheduler (P3)
+After=postgresql.service redis.service network.target
+Wants=postgresql.service redis.service
+
+[Service]
+# Polls registered monitors at their configured cadence, dispatches new
+# uploads through the transcript orchestrator, and fires per-monitor
+# webhooks. Runs as a single-process loop — no RQ needed here because the
+# orchestrator already enqueues into the whisper/enrichment queues.
+Type=simple
+User=yttranscript
+Group=yttranscript
+WorkingDirectory=/opt/yt-transcript/src
+EnvironmentFile=/opt/yt-transcript/.env
+ExecStart=/opt/yt-transcript/venv/bin/python -m app.monitor_scheduler
+Restart=on-failure
+RestartSec=10
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/yt-transcript /var/tmp/yt-transcript
+
+[Install]
+WantedBy=multi-user.target

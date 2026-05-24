@@ -203,6 +203,31 @@ Format: each entry is a short heading, the decision, the alternative considered,
 - **Alternative:** Skip cache write entirely on override (codex's first suggestion).
 - **Rationale:** Persisting the override result with a distinct hash gives us free benchmarking data (compare provider outputs side-by-side later) without breaking the default cache behavior.
 
+### JC-042 — Monitors resolve channel handles to UC IDs at create time
+- **Decision:** When creating a monitor, the route resolves `@handle` URLs to canonical `UC...` channel IDs via yt-dlp metadata before persisting. If resolution fails, return `invalid_channel` (400).
+- **Alternative:** Store the handle verbatim and try to resolve at poll time.
+- **Rationale:** YouTube's RSS feed only accepts `?channel_id=UC...`. Persisting unresolved handles means the scheduler can't poll. Fail fast at create time.
+
+### JC-043 — Monitor scheduler is hand-rolled, not APScheduler
+- **Decision:** `app.monitor_scheduler` uses a simple async loop with periodic reload (5 min) instead of APScheduler.
+- **Alternative:** APScheduler (spec §7.9 names it).
+- **Rationale:** APScheduler adds dependency weight and is awkward to combine with async polling. A 200-line loop covers the spec's requirements (per-monitor cadence, reload on new monitors, crash recovery via DB read) without extra machinery.
+
+### JC-044 — Channel expansion failure is hard error, not silent empty list
+- **Decision:** `expand_channel_or_playlist` raises `InvalidChannelError` on yt-dlp failure (network, blocked, deleted channel). Ingest surfaces this as 400.
+- **Alternative:** Return `[]` and let the ingest succeed with `video_count=0` (the codex-reviewed original).
+- **Rationale:** Silent success hides real failures. A user who pasted a wrong URL or hit YouTube IP-block deserves a clear error, not a misleading "0 videos."
+
+### JC-045 — Monitor advances `last_video_id` only through dispatched videos
+- **Decision:** When per-video dispatch fails inside the scheduler's poll loop, we stop advancing `last_video_id` at the failed video. The next poll retries from that point.
+- **Alternative:** Always advance to the newest video; lost dispatches are accepted.
+- **Rationale:** Monitor callbacks are the user-visible contract. Skipping a failed dispatch permanently loses a new-video notification. Pausing on the failure means at most one duplicate dispatch on the next poll (caught by the SETNX lock).
+
+### JC-046 — Ingest forwards monitor's callback_url instead of firing its own
+- **Decision:** When the scheduler dispatches a new video, it passes `monitor.callback_url` into the `TranscriptRequest.callback_url` field. The Whisper worker fires it on completion via the existing P1 webhook path. Cache hits fire the callback synchronously from the scheduler.
+- **Alternative:** Scheduler fires `monitor.new_video` synchronously regardless of outcome (the codex-reviewed original — which leaked queued-but-not-yet-transcribed events as if they were complete).
+- **Rationale:** Spec §7.9: "On completion of each new video, fire monitor's callback_url with the full result." That contract is only honored when the callback fires after completion, not after enqueue.
+
 ### JC-038 — Diarization audio is re-downloaded (no pass-through from Whisper)
 - **Decision:** Each diarization job downloads audio fresh via yt-dlp. No coordination with the Whisper job.
 - **Alternative:** Chain Whisper → diarization with audio path pass-through (delete-on-last-consumer pattern).

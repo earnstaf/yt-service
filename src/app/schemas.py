@@ -315,6 +315,91 @@ class SummarizeRequest(BaseModel):
         return v
 
 
+# ---------------------------------------------------------------------------
+# /v1/ingest (P3)
+# ---------------------------------------------------------------------------
+
+
+class IngestRequest(BaseModel):
+    """POST /v1/ingest body per spec §5.5."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str
+    max_videos: int = 100
+    since: str | None = None  # YYYY-MM-DD; parsed Python-side
+    include: list[str] = []
+    callback_url: str | None = None
+
+    @field_validator("max_videos")
+    @classmethod
+    def _validate_max_videos(cls, v: int) -> int:
+        if v < 1 or v > 500:
+            raise ValueError("invalid_request: max_videos must be in [1, 500]")
+        return v
+
+
+class IngestVideoOutcomeOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    status: Literal["cached", "queued", "skipped", "failed"]
+    job_id: str | None = None
+    error: str | None = None
+
+
+class IngestResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ingest_id: str
+    source: str
+    video_count: int
+    videos: list[IngestVideoOutcomeOut]
+
+
+# ---------------------------------------------------------------------------
+# /v1/monitors (P3)
+# ---------------------------------------------------------------------------
+
+
+class MonitorCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_url: str
+    poll_interval_minutes: int = 60
+    include: list[str] = []
+    callback_url: str
+    notes: str | None = None
+
+    @field_validator("poll_interval_minutes")
+    @classmethod
+    def _validate_interval(cls, v: int) -> int:
+        if v < 5 or v > 1440:
+            raise ValueError("invalid_request: poll_interval_minutes must be 5..1440")
+        return v
+
+
+class MonitorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    channel_id: str
+    channel_url: str
+    poll_interval_minutes: int
+    include: list[str]
+    callback_url: str
+    notes: str | None
+    last_polled_at: datetime | None
+    last_video_id: str | None
+    created_by: str
+    created_at: datetime
+    paused: bool
+
+    @field_serializer("last_polled_at", "created_at")
+    def _ser_dt(self, value: datetime | None) -> str | None:
+        return _to_z_iso(value)
+
+
 class KeyTimestampOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -356,4 +441,9 @@ __all__ = [
     "SummarizeRequest",
     "SummarizeResponse",
     "KeyTimestampOut",
+    "IngestRequest",
+    "IngestResponse",
+    "IngestVideoOutcomeOut",
+    "MonitorCreateRequest",
+    "MonitorResponse",
 ]

@@ -145,13 +145,65 @@ def parse_video_id(input: str) -> str:
     return candidate
 
 
-def parse_channel_or_playlist(input: str) -> tuple[Literal["channel", "playlist"], str]:
-    """Stub for P3. Will return the kind and the canonical channel/playlist ID.
+_CHANNEL_HANDLE_RE = re.compile(r"^@?[A-Za-z0-9_.-]{3,}$")
+_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_PLAYLIST_ID_RE = re.compile(r"^(PL|UU|FL|LL|RD)[A-Za-z0-9_-]{10,}$")
 
-    Declared here so the import surface is stable across phases. Channel and
-    playlist parsing lands in P3 alongside the monitor service.
-    """
-    raise NotImplementedError("channel/playlist parsing lands in P3")
+
+def parse_channel_or_playlist(raw: str):  # noqa: ANN201 — returns ChannelRef (avoid cycle)
+    """Parse a YouTube channel or playlist URL into a :class:`ChannelRef` (P3 A1)."""
+    from app.domain import ChannelRef  # noqa: PLC0415 — local
+    from app.exceptions import InvalidChannelError  # noqa: PLC0415
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise InvalidChannelError(f"empty or non-string input: {raw!r}")
+
+    candidate = raw.strip()
+    if _CHANNEL_ID_RE.match(candidate):
+        return ChannelRef(kind="channel_id", value=candidate)
+    if _PLAYLIST_ID_RE.match(candidate):
+        return ChannelRef(kind="playlist", value=candidate)
+    if candidate.startswith("@") and _CHANNEL_HANDLE_RE.match(candidate):
+        return ChannelRef(kind="channel_handle", value=candidate)
+
+    if "://" not in candidate:
+        candidate = "https://" + candidate
+    try:
+        parsed = urlparse(candidate)
+    except ValueError as exc:
+        raise InvalidChannelError(f"could not parse url {raw!r}: {exc}") from exc
+
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www.") or host.startswith("m."):
+        host = host.split(".", 1)[1]
+    if host not in ("youtube.com", "youtu.be"):
+        raise InvalidChannelError(f"not a youtube url: {raw!r}")
+
+    path = parsed.path or ""
+    if path == "/playlist":
+        params = parse_qs(parsed.query)
+        list_id = (params.get("list") or [""])[0]
+        if _PLAYLIST_ID_RE.match(list_id):
+            return ChannelRef(kind="playlist", value=list_id)
+        raise InvalidChannelError(f"playlist url missing valid list= param: {raw!r}")
+
+    if path.startswith("/@"):
+        # Handles may carry a trailing /videos, /streams, /playlists, /shorts etc.
+        handle = path[1:].split("/", 1)[0]
+        if _CHANNEL_HANDLE_RE.match(handle):
+            return ChannelRef(kind="channel_handle", value=handle)
+    for prefix in ("/c/", "/user/"):
+        if path.startswith(prefix):
+            name = path[len(prefix):].strip("/").split("/", 1)[0]
+            if _CHANNEL_HANDLE_RE.match(name):
+                return ChannelRef(kind="channel_handle", value=name)
+
+    if path.startswith("/channel/"):
+        cid = path[len("/channel/"):].strip("/").split("/", 1)[0]
+        if _CHANNEL_ID_RE.match(cid):
+            return ChannelRef(kind="channel_id", value=cid)
+
+    raise InvalidChannelError(f"could not parse channel/playlist url: {raw!r}")
 
 
 __all__ = ["parse_video_id", "parse_channel_or_playlist"]

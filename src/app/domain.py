@@ -125,3 +125,20 @@ class TranscriptRequest:
     include: list[str] = field(default_factory=list)
     callback_url: str | None = None
     token_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelRef:
+    """Parsed YouTube channel/playlist reference (P3 A1)."""
+
+    kind: Literal["channel_handle", "channel_id", "playlist"]
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class VideoSummary:
+    """Lightweight video metadata returned by playlist/channel expansion (P3 A2)."""
+
+    video_id: str
+    title: str = ""
+    upload_date: str | None = None

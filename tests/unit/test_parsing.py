@@ -106,6 +106,43 @@ def test_parse_video_id_rejects_non_string() -> None:
         parse_video_id(None)  # type: ignore[arg-type]
 
 
-def test_parse_channel_or_playlist_is_p3_stub() -> None:
-    with pytest.raises(NotImplementedError):
-        parse_channel_or_playlist("https://www.youtube.com/@SomeChannel")
+def test_parse_channel_handle_url() -> None:
+    ref = parse_channel_or_playlist("https://www.youtube.com/@SomeChannel")
+    assert ref.kind == "channel_handle"
+    assert ref.value == "@SomeChannel"
+
+
+def test_parse_channel_id_url() -> None:
+    ref = parse_channel_or_playlist(
+        "https://www.youtube.com/channel/UCBR8-60-B28hp2BmDPdntcQ"
+    )
+    assert ref.kind == "channel_id"
+    assert ref.value == "UCBR8-60-B28hp2BmDPdntcQ"
+
+
+def test_parse_playlist_url() -> None:
+    ref = parse_channel_or_playlist(
+        "https://www.youtube.com/playlist?list=PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf"
+    )
+    assert ref.kind == "playlist"
+    assert ref.value.startswith("PL")
+
+
+def test_parse_bare_handle() -> None:
+    ref = parse_channel_or_playlist("@SomeChannel")
+    assert ref.kind == "channel_handle"
+    assert ref.value == "@SomeChannel"
+
+
+def test_parse_channel_rejects_non_youtube_url() -> None:
+    from app.exceptions import InvalidChannelError
+
+    with pytest.raises(InvalidChannelError):
+        parse_channel_or_playlist("https://example.com/@foo")
+
+
+def test_parse_channel_rejects_empty() -> None:
+    from app.exceptions import InvalidChannelError
+
+    with pytest.raises(InvalidChannelError):
+        parse_channel_or_playlist("")
