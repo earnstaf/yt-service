@@ -35,6 +35,7 @@ Environment:
 - `YT_SERVICE_URL` — backend base URL. Defaults to `https://yt.ericmax.com`. For local development, set to `http://127.0.0.1:8765`.
 - `YT_SERVICE_TOKEN` — bearer token (required). Never log or echo this value.
 - `YT_SERVICE_POLL_TIMEOUT` — polling timeout in seconds for 202 responses. Default `300` (5 minutes).
+- `YT_SERVICE_ARCHIVE_DIR` — optional local directory. When set, every successful fetch writes `<video_id>.json` + `<video_id>.txt` here; every successful summary writes `<video_id>-<style>.md`. Skips writes when the target file already exists, so re-runs are idempotent. Unset = no archive (stdout-only). Recommended path on this machine: `D:\Claude Projects\Tools\yt-service\local-archive\`.
 
 Optional flags accepted by `fetch_transcript.py`:
 

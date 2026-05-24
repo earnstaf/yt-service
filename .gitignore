@@ -48,3 +48,6 @@ tmp/
 # alembic/versions/*_*.py is kept under VC; this guards local junk
 *.bak
 .claude/
+
+# Local transcript archive (YT_SERVICE_ARCHIVE_DIR target)
+local-archive/

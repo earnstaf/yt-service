@@ -69,6 +69,74 @@ def _post(url: str, token: str, body: dict) -> tuple[int, dict | str]:
             return e.code, body_text
 
 
+def _archive_summary(response: dict) -> None:
+    """Write a markdown summary to ``$YT_SERVICE_ARCHIVE_DIR`` if set.
+
+    File path: ``<archive>/<video_id>-<style>.md``. Skipped if the file
+    already exists. Failures are logged to stderr and swallowed so they
+    never break the main fetch path.
+    """
+    archive_dir = os.environ.get("YT_SERVICE_ARCHIVE_DIR")
+    if not archive_dir:
+        return
+    video_id = response.get("video_id")
+    style = response.get("style", "exec_brief")
+    if not isinstance(video_id, str) or not video_id:
+        print("archive: response missing video_id; skipping", file=sys.stderr)
+        return
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"archive: could not create {archive_dir}: {exc}", file=sys.stderr)
+        return
+
+    path = os.path.join(archive_dir, f"{video_id}-{style}.md")
+    if os.path.exists(path):
+        return
+
+    audience = response.get("audience", "")
+    provider = response.get("provider_used", "unknown")
+    summary_text = response.get("summary", "")
+    timestamps = response.get("key_timestamps") or []
+
+    lines = [
+        f"# {video_id} — {style}",
+        "",
+        f"- **Style:** {style}",
+        f"- **Audience:** {audience or '(unspecified)'}",
+        f"- **Provider:** {provider}",
+        f"- **Source video:** https://youtu.be/{video_id}",
+        "",
+        "---",
+        "",
+        summary_text.rstrip(),
+        "",
+    ]
+    if timestamps:
+        lines.append("## Key timestamps")
+        lines.append("")
+        for entry in timestamps:
+            if not isinstance(entry, dict):
+                continue
+            t = entry.get("t")
+            label = entry.get("label", "")
+            deep_link = entry.get("deep_link") or (
+                f"https://youtu.be/{video_id}?t={int(t)}" if isinstance(t, (int, float)) else ""
+            )
+            if deep_link:
+                lines.append(f"- [{label}]({deep_link})")
+            else:
+                lines.append(f"- {label}")
+        lines.append("")
+
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        print(f"archive: wrote {path}", file=sys.stderr)
+    except OSError as exc:
+        print(f"archive: could not write {path}: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video", help="YouTube video URL or 11-char ID")
@@ -114,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
     if status == 200:
         if isinstance(response, dict):
             print(json.dumps(response, indent=2))
+            _archive_summary(response)
         else:
             print(response)
         return 0

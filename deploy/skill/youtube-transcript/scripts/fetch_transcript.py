@@ -49,6 +49,55 @@ def _eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def _archive_transcript(body: bytes) -> None:
+    """Write JSON + plain text copies to ``$YT_SERVICE_ARCHIVE_DIR`` if set.
+
+    Skips writes when the target file already exists (idempotent re-runs are
+    cheap and don't churn the archive). Failures are logged to stderr and
+    swallowed so they never break the main fetch path.
+    """
+    archive_dir = os.environ.get("YT_SERVICE_ARCHIVE_DIR")
+    if not archive_dir:
+        return
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        _eprint("archive: response body was not valid JSON; skipping")
+        return
+    video_id = payload.get("video_id")
+    if not isinstance(video_id, str) or not video_id:
+        _eprint("archive: response missing video_id; skipping")
+        return
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+    except OSError as exc:
+        _eprint(f"archive: could not create {archive_dir}: {exc}")
+        return
+
+    json_path = os.path.join(archive_dir, f"{video_id}.json")
+    text_path = os.path.join(archive_dir, f"{video_id}.txt")
+
+    if not os.path.exists(json_path):
+        try:
+            with open(json_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False)
+            _eprint(f"archive: wrote {json_path}")
+        except OSError as exc:
+            _eprint(f"archive: could not write {json_path}: {exc}")
+
+    if not os.path.exists(text_path):
+        full_text = payload.get("full_text")
+        if isinstance(full_text, str):
+            try:
+                with open(text_path, "w", encoding="utf-8") as fh:
+                    fh.write(full_text)
+                    if not full_text.endswith("\n"):
+                        fh.write("\n")
+                _eprint(f"archive: wrote {text_path}")
+            except OSError as exc:
+                _eprint(f"archive: could not write {text_path}: {exc}")
+
+
 def _build_query(video: str, args: argparse.Namespace) -> str:
     """Build the query string for /v1/transcript."""
     params: dict[str, str] = {"v": video, "format": args.format, "lang": args.lang}
@@ -175,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(body.decode("utf-8", errors="replace"))
         if not body.endswith(b"\n"):
             sys.stdout.write("\n")
+        _archive_transcript(body)
         return 0
 
     if status == 202:
@@ -194,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(body2.decode("utf-8", errors="replace"))
             if not body2.endswith(b"\n"):
                 sys.stdout.write("\n")
+            _archive_transcript(body2)
             return 0
         _print_error_envelope(status2, body2)
         return 1
