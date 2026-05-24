@@ -37,7 +37,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import cache, jobs, serialization, transcript_service
+from app import cache, chapters as chapters_mod, jobs, serialization, transcript_service
+from app.tasks import summarize as summarize_task
 from app.auth import bootstrap_admin_token, require_scopes
 from app.config import get_settings
 from app.db import check_db_health, close_db, get_session, get_session_factory
@@ -66,9 +67,12 @@ from app.schemas import (
     HealthResponse,
     JobAcceptedResponse,
     JobStatusResponse,
+    SummarizeRequest,
+    SummarizeResponse,
     TranscriptResponse,
     TranscriptSnippetOut,
 )
+from app.exceptions import InsufficientScopeError
 
 _logger = get_logger("main")
 
@@ -110,8 +114,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001 — FastAPI signature
 
 def _envelope_response(exc: YTServiceError) -> JSONResponse:
     """Render a YTServiceError as JSONResponse, adding Retry-After when present."""
+    from app.exceptions import DailyCostCapExceededError  # noqa: PLC0415 — local
+
     headers: dict[str, str] = {}
-    if isinstance(exc, RateLimitedError):
+    if isinstance(exc, (RateLimitedError, DailyCostCapExceededError)):
         retry_after = (exc.details or {}).get("retry_after")
         if retry_after is not None:
             headers["Retry-After"] = str(retry_after)
@@ -215,6 +221,96 @@ def _parse_include(raw: str | None) -> list[str]:
     if not raw:
         return []
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+async def _merge_chapters(
+    session: AsyncSession,
+    response: TranscriptResponse,
+) -> TranscriptResponse:
+    """Populate ``response.chapters`` by computing/caching as needed (P2 E2)."""
+    record = await cache.get_transcript(session, response.video_id, response.language)
+    if record is None:
+        return response
+    chapters_list = await chapters_mod.get_or_compute_chapters(session, record)
+    from app.schemas import ChapterOut  # local to avoid circular import at top
+
+    return response.model_copy(
+        update={
+            "chapters": [
+                ChapterOut(start=c.start, end=c.end, title=c.title) for c in chapters_list
+            ]
+        }
+    )
+
+
+async def _merge_speakers(
+    session: AsyncSession,
+    redis_client: Any,
+    response: TranscriptResponse,
+    token_id: str,
+) -> TranscriptResponse:
+    """Annotate the response with diarization status (JC-031).
+
+    Branches:
+
+    - Already diarized in cache → ``has_diarization=True``.
+    - Captions-source transcript → ``diarization_status="captions_source_unsupported"``,
+      no enqueue.
+    - Whisper-source, undiarized → enqueue an enrichment job, ``diarization_status="queued"``,
+      ``diarization_job_id=<id>``.
+    """
+    record = await cache.get_transcript(session, response.video_id, response.language)
+    if record is None:
+        return response
+
+    if record.has_diarization:
+        return response.model_copy(update={"has_diarization": True})
+
+    if record.source == "youtube_captions":
+        return response.model_copy(
+            update={
+                "has_diarization": False,
+                "diarization_status": "captions_source_unsupported",
+            }
+        )
+
+    # Whisper source, no diarization yet. Idempotent enqueue (SETNX lock).
+    from app.exceptions import JobInProgressError  # noqa: PLC0415 — local
+
+    try:
+        job = await jobs.enqueue_diarization(
+            session,
+            redis_client,
+            video_id=response.video_id,
+            token_id=token_id,
+            language=response.language,
+        )
+        return response.model_copy(
+            update={
+                "has_diarization": False,
+                "diarization_status": "queued",
+                "diarization_job_id": job.job_id,
+            }
+        )
+    except JobInProgressError as exc:
+        if exc.existing_job_id:
+            return response.model_copy(
+                update={
+                    "has_diarization": False,
+                    "diarization_status": "queued",
+                    "diarization_job_id": exc.existing_job_id,
+                }
+            )
+        # Stale lock without a recoverable job_id — log + surface unset.
+        _logger.warning("diarization_lock_stuck", video_id=response.video_id)
+        return response.model_copy(update={"has_diarization": False})
+    except Exception as exc:  # noqa: BLE001 — diarization is best-effort
+        _logger.warning(
+            "diarization_enqueue_failed",
+            video_id=response.video_id,
+            error=str(exc),
+        )
+        return response.model_copy(update={"has_diarization": False})
 
 
 def _host_is_loopback(host: str | None) -> bool:
@@ -343,6 +439,16 @@ def _build_v1_router() -> APIRouter:
             assert isinstance(payload, TranscriptResponse)
             request.state.source = payload.source
             request.state.cache_hit = payload.cache_hit
+            include_tokens = _parse_include(include)
+            # P2 enrichment merge after the orchestrator returns. Route layer
+            # owns this so transcript_service stays focused on transcript
+            # availability (plan E2 + JC-031).
+            if "chapters" in include_tokens:
+                payload = await _merge_chapters(session, payload)
+            if "speakers" in include_tokens:
+                payload = await _merge_speakers(
+                    session, redis_client, payload, token_id=getattr(token, "id", "")
+                )
             if format == "text":
                 return PlainTextResponse(payload.full_text)
             if format == "srt":
@@ -360,10 +466,20 @@ def _build_v1_router() -> APIRouter:
                     serialization.to_srt(srt_snippets),
                     media_type="application/x-subrip",
                 )
-            return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
+            # Drop unset P2 diarization fields so P1 clients don't see new
+            # ``diarization_status: null`` etc. on every response. We use
+            # `exclude_unset=True` so only fields explicitly set by
+            # ``_merge_speakers`` (or returned from the cache as True) appear.
+            return JSONResponse(
+                status_code=200,
+                content=payload.model_dump(mode="json", exclude_unset=True),
+            )
         # job_accepted
         assert isinstance(payload, JobAcceptedResponse)
-        return JSONResponse(status_code=202, content=payload.model_dump(mode="json"))
+        return JSONResponse(
+            status_code=202,
+            content=payload.model_dump(mode="json", exclude_unset=True),
+        )
 
     @router.post("/transcript:batch", response_model=None)
     async def post_transcript_batch(
@@ -496,6 +612,51 @@ def _build_v1_router() -> APIRouter:
         await enforce_rate_limit("read", request, redis_client)
         data = await cache.stats(session)
         return CacheStatsResponse(**data)
+
+    @router.post("/summarize", response_model=SummarizeResponse)
+    async def post_summarize(
+        body: SummarizeRequest,
+        request: Request,
+        session: AsyncSession = Depends(get_session),
+        redis_client: Any = Depends(get_redis_client),
+        token: Any = Depends(require_scopes("summarize")),
+    ) -> SummarizeResponse:
+        """Summarize a cached transcript. P2.
+
+        ``provider_override`` requires admin scope (JC-037). The route applies
+        the additional check inline so the dependency stays simple.
+        """
+        await enforce_rate_limit("summarize", request, redis_client)
+        if body.provider_override is not None:
+            token_scopes = getattr(token, "scopes", None) or []
+            if "admin" not in token_scopes:
+                raise InsufficientScopeError("provider_override requires admin scope")
+
+        parsed = parse_video_id(body.video_id)
+        result = await summarize_task.summarize(
+            session,
+            video_id=parsed,
+            style=body.style,
+            audience=body.audience,
+            custom_prompt=body.custom_prompt,
+            max_tokens=body.max_tokens,
+            include_timestamps=body.include_timestamps,
+            provider_override=body.provider_override,
+            token_id=getattr(token, "id", None),
+        )
+        enriched = summarize_task.enrich_with_deep_links(result.key_timestamps, parsed)
+        return SummarizeResponse(
+            video_id=result.video_id,
+            style=result.style,
+            audience=result.audience,
+            summary=result.summary,
+            key_timestamps=enriched,
+            provider_used=result.provider_used,
+            tokens_in=result.tokens_in,
+            tokens_out=result.tokens_out,
+            cost_usd=float(result.cost_usd),
+            cached=result.cached,
+        )
 
     return router
 

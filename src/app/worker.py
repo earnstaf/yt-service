@@ -226,31 +226,145 @@ async def _enqueue_completion_webhook(
     )
 
 
-def make_worker() -> Worker:
-    """Construct an RQ ``Worker`` bound to the ``whisper`` queue.
+def run_diarization_job(job_id: str) -> None:
+    """RQ entry point for diarization. See :func:`_run_diarization_job_async`."""
+    asyncio.run(_run_diarization_job_async(job_id))
 
-    Used by ``deploy/yt-transcript-worker-whisper.service`` as the systemd
-    entrypoint and by the dev runner ``python -m app.worker``. The worker
-    uses a *synchronous* Redis client because RQ requires sync I/O for its
+
+async def _run_diarization_job_async(job_id: str) -> None:
+    """Pipeline: load job → load transcript → download audio → diarize → persist.
+
+    Refuses to diarize captions-source transcripts (JC-032). Cleans audio
+    in ``finally``. Releases the diarize lock with the job_id as owner.
+    """
+    from app import cache as cache_mod  # noqa: PLC0415 — avoid cycles
+    from app import diarization, jobs as jobs_mod  # noqa: PLC0415
+    from app.redis_client import get_redis_client  # noqa: PLC0415
+    from app.whisper.audio import cleanup as cleanup_audio, download_audio  # noqa: PLC0415
+
+    factory = get_session_factory()
+    redis = get_redis_client()
+
+    audio_path: Path | None = None
+    video_id: str | None = None
+
+    try:
+        async with factory() as session:
+            job = await jobs_mod.get_job(session, job_id)
+            if job is None:
+                _logger.warning("diarization_job_missing", job_id=job_id)
+                return
+            video_id = job.video_id
+            payload = job.payload_jsonb or {}
+            language = payload.get("language", "en")
+
+            await jobs_mod.mark_running(session, job_id)
+
+            record = await cache_mod.get_transcript(session, video_id, language)
+            if record is None:
+                await jobs_mod.mark_failed(
+                    session, job_id, "transcript not cached; fetch /v1/transcript first"
+                )
+                return
+
+            if record.source == "youtube_captions":
+                await jobs_mod.mark_failed(
+                    session,
+                    job_id,
+                    "diarization not supported on captions-sourced transcripts; "
+                    "use force=whisper to re-transcribe via Whisper first",
+                )
+                return
+
+            if not diarization.is_available():
+                await jobs_mod.mark_failed(
+                    session,
+                    job_id,
+                    "diarization unavailable: HUGGINGFACE_TOKEN missing or "
+                    "pyannote model not accessible",
+                )
+                return
+
+        ACTIVE_JOBS.labels(type="enrichment").inc()
+        try:
+            with JOB_DURATION.labels(type="enrichment").time():
+                audio_path = await download_audio(video_id, Path(settings.ytdlp_tmp_dir))
+                tagged = await diarization.diarize(audio_path, record.snippets)
+
+            async with factory() as session:
+                rowcount = await cache_mod.put_diarization(
+                    session, video_id, language, tagged, has_diarization=True
+                )
+                if rowcount == 0:
+                    await session.rollback()
+                    await jobs_mod.mark_failed(
+                        session,
+                        job_id,
+                        "transcript row missing or purged during diarization",
+                    )
+                else:
+                    await session.commit()
+                    await jobs_mod.mark_complete(session, job_id)
+        finally:
+            ACTIVE_JOBS.labels(type="enrichment").dec()
+    except Exception as exc:  # noqa: BLE001
+        _logger.error(
+            "diarization_job_unexpected_error",
+            job_id=job_id,
+            error=str(exc),
+            exc_info=True,
+        )
+        try:
+            async with factory() as session:
+                await jobs_mod.mark_failed(session, job_id, f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        if video_id is not None:
+            try:
+                await jobs.release_lock(redis, video_id, op="diarize", value=job_id)
+            except Exception:  # noqa: BLE001
+                pass
+        if audio_path is not None:
+            cleanup_audio(audio_path)
+
+
+def make_worker(queue_name: str = "whisper") -> Worker:
+    """Construct an RQ ``Worker`` bound to ``queue_name``.
+
+    P2: ``queue_name`` is parameterized so the same factory drives both the
+    whisper systemd unit and the enrichment unit. The worker uses a
+    *synchronous* Redis client because RQ requires sync I/O for its
     pubsub keepalive — separate from the async client the orchestrator uses.
-    Routed through :func:`app.redis_client.get_sync_redis_client` so the
-    shared cached instance is reused across modules.
     """
     from app.redis_client import get_sync_redis_client  # noqa: PLC0415 — lazy
 
     sync_redis = get_sync_redis_client()
-    queue = Queue(_WHISPER_QUEUE, connection=sync_redis)
+    queue = Queue(queue_name, connection=sync_redis)
     return Worker([queue], connection=sync_redis)
 
 
+def make_enrichment_worker() -> Worker:
+    """Convenience factory for the enrichment queue (diarization in P2)."""
+    return make_worker(queue_name="enrichment")
+
+
 if __name__ == "__main__":  # pragma: no cover — manual invocation only
-    # Allow ``python -m app.worker`` to start a Whisper worker in dev.
+    # ``python -m app.worker [queue_name]``. Defaults to whisper for back-compat.
+    import sys
+
     from app.logging import configure_logging
 
+    queue_name = sys.argv[1] if len(sys.argv) > 1 else "whisper"
     configure_logging(settings.yt_log_level)
-    _logger.info("starting_whisper_worker", pid=os.getpid())
-    worker = make_worker()
+    _logger.info("starting_worker", queue=queue_name, pid=os.getpid())
+    worker = make_worker(queue_name=queue_name)
     worker.work(with_scheduler=True)
 
 
-__all__ = ["run_whisper_job", "make_worker"]
+__all__ = [
+    "run_whisper_job",
+    "run_diarization_job",
+    "make_worker",
+    "make_enrichment_worker",
+]

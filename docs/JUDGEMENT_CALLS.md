@@ -153,6 +153,61 @@ Format: each entry is a short heading, the decision, the alternative considered,
 - **Alternative:** Validate per-item so a single bad URL only fails that one slot.
 - **Rationale:** All batch items share the SAME `callback_url`, so per-item validation would produce N identical errors. One up-front rejection is clearer for the caller.
 
+### JC-031 — `include=speakers` returns 200 (not 202) with enrichment-job side-effect
+- **Decision:** `GET /v1/transcript?include=speakers` when diarization isn't yet computed returns 200 with the transcript body plus `diarization_status: "queued"` and `diarization_job_id: <id>` fields. The diarization job is enqueued as a side-effect. Client polls `/v1/jobs/<id>` and re-fetches the transcript when complete.
+- **Alternative:** Return 202 (matches the whisper-202 pattern); or refuse to enqueue side-effects on GETs.
+- **Rationale:** Unlike Whisper-202 (where the transcript itself is not yet available), the transcript IS available at request time — diarization is enrichment that lands later. Returning 200 with the body is more useful. The side-effect is idempotent (SETNX lock prevents duplicate jobs). Spec §5.5 explicitly allows "Returns nulls if data not yet computed."
+
+### JC-032 — Diarization refuses captions-sourced transcripts
+- **Decision:** If `transcript.source == "youtube_captions"`, diarization jobs fail fast with error `"diarization not supported on captions-sourced transcripts; use force=whisper to re-transcribe via Whisper first"`. Only `whisper_openai` and `whisper_local` sources are eligible.
+- **Alternative:** Accept misalignment risk and run diarization on captions transcripts with a tolerance window.
+- **Rationale:** YT-served caption timestamps may not align precisely with audio extracted by yt-dlp (different stream sources, different timing). Overlap matching would produce wrong speaker tags. Spec §7.6 already notes "For captions-only path, diarization requires triggering audio download separately" — we surface this as an explicit refusal with a clear remediation path.
+
+### JC-033 — Daily LLM cost cap is `DailyCostCapExceededError → 503`, not `LLMFailedError → 502`
+- **Decision:** New `DailyCostCapExceededError` exception with `status_code=503` and `error_code="daily_cost_cap"`. Distinct from `LLMFailedError` (provider failure, 502).
+- **Alternative:** Overload `LLMFailedError` for cost-cap (subagent's first cut would have).
+- **Rationale:** Cost cap is a quota/policy decision, not an upstream provider failure. 503 with `Retry-After` (set to seconds until UTC midnight) signals the client should back off. 502 would suggest "try again" which is wrong.
+
+### JC-034 — LLM cost per-worker 60s cache acknowledged as approximate
+- **Decision:** Daily-cost-sum is cached in memory per worker process for 60s to avoid hammering Postgres. Worst-case overshoot bounded by `N_workers × concurrent_calls × max_single_call_cost`. Acceptable for single-org P2.
+- **Alternative:** No cache (query DB every call) or distributed cache via Redis.
+- **Rationale:** P2 traffic is low; the cost cap is a safety net, not a precision metering tool. Distributed cache adds complexity for marginal value. Documented as approximate.
+
+### JC-035 — `chapters_jsonb`: `[]` means "tried, got nothing"; `NULL` means "never tried"
+- **Decision:** Empty list `[]` is stored after a failed LLM derivation or after a yt-dlp metadata call returning no chapters. `NULL` only via direct purge. `get_or_compute_chapters` treats `IS NOT NULL` as "cached, return as-is."
+- **Alternative:** Re-derive on every call when result is empty.
+- **Rationale:** Chapter derivation is the most expensive `include=chapters` path. Cacheing the negative result prevents infinite re-derivation on short videos that legitimately have no chapter structure.
+
+### JC-036 — Chapter LLM derivation refused for very long transcripts
+- **Decision:** Refuse LLM chapter derivation when `len(full_text) > 200_000` chars (~50k tokens). Yt-dlp chapter discovery is still attempted; failing that, persist `[]` and move on.
+- **Alternative:** Map-reduce the transcript into windowed chapter proposals.
+- **Rationale:** Map-reduce is a P3+ project. For P2, capping at 50k tokens keeps a single LLM call within budget for cheap providers (gemini-2.5-flash handles it fine). Very long videos either come with YT-published chapters (most do) or stay chapterless.
+
+### JC-037 — `provider_override` requires admin scope, validated at the route layer
+- **Decision:** `POST /v1/summarize` depends on `require_scopes("summarize")`. If the request body sets `provider_override`, the route handler additionally checks `Token.has_scope("admin")` inline and raises `InsufficientScopeError` if missing. Schema validates the format with regex `^(anthropic_direct|openai_direct|gemini_direct|llmapi)/[\w\-.]+$`.
+- **Alternative:** Dynamic dependency that switches scope based on body content (complex), or rejecting `provider_override` from the schema layer (loses route context for clear error).
+- **Rationale:** Inline route-layer check keeps the dependency simple and the error clean. Admin tokens already have `summarize` scope implicitly, so no conflict.
+
+### JC-039 — `put_transcript` always resets `has_diarization` to the new record's value (codex fix)
+- **Decision:** When `put_transcript` upserts an existing row, `has_diarization` is always set to the incoming record's value. Speaker tags are tied to the snippets they annotate; if snippets are replaced, the diarization invariant is broken.
+- **Alternative:** Preserve `has_diarization=True` across writes (the original P2 plan implementation).
+- **Rationale:** Codex flagged that the original behavior allowed `snippets_jsonb` to be replaced (e.g., on `force=refresh`) while `has_diarization=True` persisted, which would falsely tell clients diarization was current. The diarization worker uses `put_diarization` (partial UPDATE) and never goes through `put_transcript`, so the reset is correct.
+
+### JC-040 — Cost cap response carries `Retry-After: <seconds-to-utc-midnight>`
+- **Decision:** `DailyCostCapExceededError` includes a `retry_after` field in `details`, computed as seconds until the next UTC 00:00. The main exception handler reads it and sets the `Retry-After` HTTP header.
+- **Alternative:** Omit the header (client guesses).
+- **Rationale:** The cost cap is wall-clock-bounded (resets at UTC midnight). Telling clients the exact backoff window is straightforward and avoids them retrying every minute.
+
+### JC-041 — `provider_override` bypasses summary cache + hashes into the cache key
+- **Decision:** When `provider_override` is set, the cache lookup is skipped entirely, AND the override value is mixed into `custom_hash` so subsequent default-provider calls don't see the override-produced row.
+- **Alternative:** Skip cache write entirely on override (codex's first suggestion).
+- **Rationale:** Persisting the override result with a distinct hash gives us free benchmarking data (compare provider outputs side-by-side later) without breaking the default cache behavior.
+
+### JC-038 — Diarization audio is re-downloaded (no pass-through from Whisper)
+- **Decision:** Each diarization job downloads audio fresh via yt-dlp. No coordination with the Whisper job.
+- **Alternative:** Chain Whisper → diarization with audio path pass-through (delete-on-last-consumer pattern).
+- **Rationale:** Job isolation is cleaner. Diarization is CPU-bound (~0.5× realtime on CPU), so the ~30-50s download overhead is dominated by inference. Pass-through is a P3+ optimization if metrics show download bandwidth becomes a bottleneck.
+
 ### JC-030 — Bootstrap admin advisory lock is a no-op on non-Postgres backends
 - **Decision:** `bootstrap_admin_token` calls `pg_advisory_lock` only when the active dialect is `postgresql`. SQLite (used in some unit-test fixtures) skips the lock entirely.
 - **Alternative:** Use a portable table-row lock or skip bootstrap entirely outside Postgres.

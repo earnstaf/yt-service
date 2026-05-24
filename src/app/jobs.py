@@ -37,14 +37,28 @@ from app.models import Job
 
 _logger = get_logger("jobs")
 
-# RQ queue name for Whisper jobs. Must match the queue passed to the worker
-# in :func:`app.worker.make_worker`.
-_WHISPER_QUEUE = "whisper"
+# Per-job-type registry (P2 A0-2). Each entry pins the RQ queue, the
+# fully-qualified task path the worker exposes, the Redis lock op segment,
+# and a default ``estimated_seconds`` for the 202 response shape. Adding
+# new job types (e.g., topics in P4) only requires extending this dict.
+_JOB_REGISTRY: dict[str, dict[str, Any]] = {
+    "whisper": {
+        "queue": "whisper",
+        "task": "app.worker.run_whisper_job",
+        "lock_op": "whisper",
+        "estimated_seconds": 90,
+    },
+    "enrichment": {
+        "queue": "enrichment",
+        "task": "app.worker.run_diarization_job",
+        "lock_op": "diarize",
+        "estimated_seconds": 60,
+    },
+}
 
-# RQ task path. Points at :func:`app.worker.run_whisper_job`. We use a dotted
-# string so this module never imports ``app.worker`` (which itself imports
-# ``app.jobs`` to flip state — a direct import would be a cycle).
-_WHISPER_TASK_PATH = "app.worker.run_whisper_job"
+# Backwards-compatible aliases used by older P1 call sites / tests.
+_WHISPER_QUEUE = _JOB_REGISTRY["whisper"]["queue"]
+_WHISPER_TASK_PATH = _JOB_REGISTRY["whisper"]["task"]
 
 # Lock TTL for Whisper operations. The spec says 1h is the upper bound for
 # reasonable Whisper runs; if a worker dies without releasing, the lock
@@ -138,17 +152,22 @@ async def _steal_stale_lock(redis_client: Any, video_id: str, op: str = "whisper
     _logger.warning("whisper_stale_lock_stolen", video_id=video_id, op=op)
 
 
-async def _find_in_progress_job(session: AsyncSession, video_id: str) -> Job | None:
-    """Return the most recent ``queued``/``running`` Whisper job for ``video_id``.
+async def _find_in_progress_job(
+    session: AsyncSession,
+    video_id: str,
+    job_type: str = "whisper",
+) -> Job | None:
+    """Return the most recent ``queued``/``running`` job for ``(video_id, job_type)``.
 
     Used to recover the existing ``job_id`` when lock acquisition fails so the
     orchestrator can return 202 with an actionable poll URL instead of a
-    bare 409.
+    bare 409. P2 adds ``job_type`` as an explicit parameter so diarization
+    enqueues don't accidentally claim a whisper job's identity.
     """
     stmt = (
         select(Job)
         .where(Job.video_id == video_id)
-        .where(Job.job_type == "whisper")
+        .where(Job.job_type == job_type)
         .where(Job.status.in_(("queued", "running")))
         .order_by(Job.created_at.desc())
         .limit(1)
@@ -176,71 +195,76 @@ def _get_rq_queue(name: str = _WHISPER_QUEUE) -> Queue:
     return Queue(name, connection=get_sync_redis_client())
 
 
-async def enqueue_whisper(
+async def enqueue_job(
     session: AsyncSession,
     redis_client: Any,
-    payload: JobPayload,
+    *,
+    video_id: str,
+    job_type: str,
+    payload: dict[str, Any],
     token_id: str,
 ) -> Job:
-    """Enqueue a Whisper job for ``payload['video_id']``.
+    """Generic enqueue for any registered ``job_type`` (whisper | enrichment | ...).
 
-    Lifecycle:
+    Lifecycle, parameterized via ``_JOB_REGISTRY[job_type]``:
 
     1. Mint a fresh ``job_id`` (used as the lock owner value).
-    2. Acquire ``lock:whisper:{video_id}`` via SETNX with 1h TTL and the
-       new ``job_id`` as the stored value.
-    3. If acquisition fails, look up the in-progress job and raise
-       :class:`JobInProgressError` carrying its id and poll URL. If no row
-       exists, wait briefly and retry the lookup once; if STILL nothing,
-       treat the lock as orphaned, steal it, and retry SETNX.
-    4. Insert a new ``jobs`` row in status ``queued`` and commit so the RQ
-       worker can read it back.
-    5. Enqueue the RQ task ``app.worker.run_whisper_job`` on the
-       ``whisper`` queue with the new ``job_id`` as its only argument.
+    2. Acquire ``lock:{lock_op}:{video_id}`` via SETNX/EX with the new
+       ``job_id`` as the stored value.
+    3. On lock conflict, look up an in-progress job of the same ``job_type``
+       and raise :class:`JobInProgressError`. Stale-lock recovery same as
+       P1 (50ms recheck, then steal).
+    4. Insert + commit the ``jobs`` row.
+    5. Enqueue the registered RQ task on the registered queue.
 
     Returns the newly created ``Job`` ORM instance.
     """
-    video_id = payload["video_id"]
+    if job_type not in _JOB_REGISTRY:
+        raise ValueError(f"unknown job_type: {job_type!r}")
+    entry = _JOB_REGISTRY[job_type]
+    lock_op = entry["lock_op"]
+    queue_name = entry["queue"]
+    task_path = entry["task"]
+
     callback_url = payload.get("callback_url")
 
     job_id = _new_job_id()
-    acquired = await acquire_lock(redis_client, video_id, "whisper", value=job_id)
+    acquired = await acquire_lock(redis_client, video_id, lock_op, value=job_id)
     if not acquired:
-        existing = await _find_in_progress_job(session, video_id)
+        existing = await _find_in_progress_job(session, video_id, job_type=job_type)
         if existing is not None:
             raise JobInProgressError(
                 existing_job_id=existing.job_id,
                 poll_url=poll_url_for(existing.job_id),
-                message="whisper job already running for video",
-                details={"video_id": video_id},
+                message=f"{job_type} job already running for video",
+                details={"video_id": video_id, "job_type": job_type},
             )
         # Lock held but no job row visible — likely the lock holder hasn't
-        # committed the row yet (race), OR the lock is stale from a crashed
-        # worker. Sleep briefly and retry the lookup once.
+        # committed yet (race), OR the lock is stale from a crashed worker.
         await asyncio.sleep(0.05)
-        existing = await _find_in_progress_job(session, video_id)
+        existing = await _find_in_progress_job(session, video_id, job_type=job_type)
         if existing is not None:
             raise JobInProgressError(
                 existing_job_id=existing.job_id,
                 poll_url=poll_url_for(existing.job_id),
-                message="whisper job already running for video",
-                details={"video_id": video_id},
+                message=f"{job_type} job already running for video",
+                details={"video_id": video_id, "job_type": job_type},
             )
         # Truly orphaned lock. Steal it and retry SETNX once.
-        await _steal_stale_lock(redis_client, video_id, "whisper")
-        acquired = await acquire_lock(redis_client, video_id, "whisper", value=job_id)
+        await _steal_stale_lock(redis_client, video_id, lock_op)
+        acquired = await acquire_lock(redis_client, video_id, lock_op, value=job_id)
         if not acquired:
             raise JobInProgressError(
                 existing_job_id="",
                 poll_url="",
-                message="whisper lock held but no job row found",
-                details={"video_id": video_id},
+                message=f"{job_type} lock held but no job row found",
+                details={"video_id": video_id, "job_type": job_type},
             )
 
     job = Job(
         job_id=job_id,
         video_id=video_id,
-        job_type="whisper",
+        job_type=job_type,
         status="queued",
         token_id=token_id,
         callback_url=callback_url,
@@ -250,16 +274,88 @@ async def enqueue_whisper(
     await session.commit()
     await session.refresh(job)
 
-    queue = _get_rq_queue(_WHISPER_QUEUE)
-    queue.enqueue(_WHISPER_TASK_PATH, job_id)
+    # If RQ enqueue fails (Redis down, queue full, serialization error), the
+    # job row is already committed in ``queued`` state and the lock is held.
+    # Flip the row to ``failed`` and release the lock so subsequent retries
+    # don't see a phantom in-progress job and a stuck lock.
+    try:
+        queue = _get_rq_queue(queue_name)
+        queue.enqueue(task_path, job_id)
+    except Exception as exc:  # noqa: BLE001
+        await mark_failed(session, job_id, f"enqueue failed: {type(exc).__name__}: {exc}")
+        try:
+            await release_lock(redis_client, video_id, op=lock_op, value=job_id)
+        except Exception:  # noqa: BLE001
+            pass
+        _logger.error(
+            "job_enqueue_failed",
+            job_id=job_id,
+            video_id=video_id,
+            job_type=job_type,
+            error=str(exc),
+        )
+        raise
 
     _logger.info(
-        "whisper_job_enqueued",
+        "job_enqueued",
         job_id=job_id,
         video_id=video_id,
+        job_type=job_type,
         token_id=token_id,
     )
     return job
+
+
+async def enqueue_whisper(
+    session: AsyncSession,
+    redis_client: Any,
+    payload: JobPayload,
+    token_id: str,
+) -> Job:
+    """Thin wrapper around :func:`enqueue_job` for the whisper job type.
+
+    Kept for backward compatibility with P1 call sites and tests that
+    constructed the whisper ``JobPayload`` directly. New call sites should
+    use :func:`enqueue_job` or the type-specific helpers below.
+    """
+    return await enqueue_job(
+        session,
+        redis_client,
+        video_id=payload["video_id"],
+        job_type="whisper",
+        payload=dict(payload),
+        token_id=token_id,
+    )
+
+
+async def enqueue_diarization(
+    session: AsyncSession,
+    redis_client: Any,
+    video_id: str,
+    token_id: str,
+    language: str = "en",
+) -> Job:
+    """Enqueue a diarization enrichment job for ``video_id``.
+
+    The diarization worker (:func:`app.worker.run_diarization_job`) loads
+    the cached transcript, downloads audio fresh, runs pyannote, and
+    partial-updates the transcript row via :func:`app.cache.put_diarization`.
+    """
+    payload = {
+        "video_id": video_id,
+        "language": language,
+        "force_whisper": False,
+        "include": ["speakers"],
+        "callback_url": None,
+    }
+    return await enqueue_job(
+        session,
+        redis_client,
+        video_id=video_id,
+        job_type="enrichment",
+        payload=payload,
+        token_id=token_id,
+    )
 
 
 async def get_job(session: AsyncSession, job_id: str) -> Job | None:
@@ -302,7 +398,9 @@ async def mark_failed(session: AsyncSession, job_id: str, error: str) -> None:
 
 
 __all__ = [
+    "enqueue_job",
     "enqueue_whisper",
+    "enqueue_diarization",
     "get_job",
     "mark_running",
     "mark_complete",

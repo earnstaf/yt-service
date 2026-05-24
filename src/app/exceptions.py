@@ -157,6 +157,17 @@ class LLMFailedError(YTServiceError):
     status_code = 502
 
 
+class DailyCostCapExceededError(YTServiceError):
+    """503 — daily LLM cost cap reached. Distinct from LLM failure (502).
+
+    JC-033: surfaces as 503 (not 502) because this is a quota/policy decision,
+    not an upstream provider failure. Clients should back off.
+    """
+
+    error_code = "daily_cost_cap"
+    status_code = 503
+
+
 class QueueFullError(YTServiceError):
     """503 — queue depth above threshold; refuse new work."""
 

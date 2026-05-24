@@ -33,7 +33,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.domain import Snippet, TranscriptRecord, TranscriptSource
+from app.domain import Chapter, Snippet, TranscriptRecord, TranscriptSource
 from app.metrics import CACHE_HITS, CACHE_MISSES
 from app.models import Transcript
 
@@ -67,9 +67,34 @@ def _dict_to_snippet(raw: dict[str, Any]) -> Snippet:
     )
 
 
+def _chapter_to_dict(chapter: Chapter) -> dict[str, Any]:
+    """Serialize a ``Chapter`` to the JSONB-safe dict shape stored in Postgres."""
+    return {"start": chapter.start, "end": chapter.end, "title": chapter.title}
+
+
+def _dict_to_chapter(raw: dict[str, Any]) -> Chapter:
+    """Reconstruct a ``Chapter`` from a stored JSONB dict."""
+    return Chapter(start=float(raw["start"]), end=float(raw["end"]), title=raw["title"])
+
+
 def _row_to_record(row: Transcript) -> TranscriptRecord:
-    """Map an ORM ``Transcript`` row into the canonical ``TranscriptRecord``."""
+    """Map an ORM ``Transcript`` row into the canonical ``TranscriptRecord``.
+
+    P2: ``chapters_jsonb`` is now decoded. The JSONB column carries one of
+    three meanings (JC-035):
+
+    - ``None``: never tried. The orchestrator/route will compute on first
+      ``include=chapters`` request.
+    - ``[]``: tried, got nothing. Don't re-derive.
+    - ``[{...}, ...]``: cached non-empty list.
+    """
     snippets = [_dict_to_snippet(s) for s in (row.snippets_jsonb or [])]
+    chapters_raw = row.chapters_jsonb
+    chapters: list[Chapter] | None
+    if chapters_raw is None:
+        chapters = None
+    else:
+        chapters = [_dict_to_chapter(c) for c in chapters_raw]
     return TranscriptRecord(
         video_id=row.video_id,
         language=row.language,
@@ -80,7 +105,7 @@ def _row_to_record(row: Transcript) -> TranscriptRecord:
         cached_at=row.fetched_at,
         snippets=snippets,
         full_text=row.full_text,
-        chapters=None,  # P2 will populate from row.chapters_jsonb
+        chapters=chapters,
         has_diarization=row.has_diarization,
     )
 
@@ -135,6 +160,11 @@ async def put_transcript(
     expires_at = now + timedelta(days=ttl_days)
 
     snippets_payload = [_snippet_to_dict(s) for s in record.snippets]
+    chapters_payload: list[dict[str, Any]] | None
+    if record.chapters is None:
+        chapters_payload = None
+    else:
+        chapters_payload = [_chapter_to_dict(c) for c in record.chapters]
 
     values: dict[str, Any] = {
         "video_id": record.video_id,
@@ -144,30 +174,95 @@ async def put_transcript(
         "duration_seconds": record.duration_seconds,
         "snippets_jsonb": snippets_payload,
         "full_text": record.full_text,
-        "chapters_jsonb": None,
+        "chapters_jsonb": chapters_payload,
         "has_diarization": record.has_diarization,
         "fetched_at": fetched_at,
         "expires_at": expires_at,
     }
 
     stmt = pg_insert(Transcript).values(**values)
-    update_cols = {
+    # On conflict, preserve chapters unless the new record explicitly carries
+    # them. For diarization: ALWAYS reset to ``has_diarization=False`` when
+    # snippets are replaced — replacing snippets invalidates any prior speaker
+    # tags. The diarization worker (which re-tags in place) uses
+    # ``put_diarization`` (partial UPDATE) and never goes through this path,
+    # so this reset is correct and prevents the codex-flagged invariant
+    # violation where snippets get replaced but ``has_diarization`` stays True.
+    update_cols: dict[str, Any] = {
         "source": stmt.excluded.source,
         "is_generated": stmt.excluded.is_generated,
         "duration_seconds": stmt.excluded.duration_seconds,
         "snippets_jsonb": stmt.excluded.snippets_jsonb,
         "full_text": stmt.excluded.full_text,
-        "chapters_jsonb": stmt.excluded.chapters_jsonb,
-        "has_diarization": stmt.excluded.has_diarization,
         "fetched_at": stmt.excluded.fetched_at,
         "expires_at": stmt.excluded.expires_at,
+        "has_diarization": stmt.excluded.has_diarization,
     }
+    if record.chapters is not None:
+        update_cols["chapters_jsonb"] = stmt.excluded.chapters_jsonb
     stmt = stmt.on_conflict_do_update(
         index_elements=[Transcript.video_id, Transcript.language],
         set_=update_cols,
     )
 
     await session.execute(stmt)
+
+
+async def put_chapters(
+    session: AsyncSession,
+    video_id: str,
+    language: str,
+    chapters: list[Chapter] | None,
+) -> None:
+    """Partial-update ``transcripts.chapters_jsonb`` only. Does not commit.
+
+    JC-035 semantics:
+
+    - ``chapters=None`` stores SQL NULL (effectively a "retry on next call").
+    - ``chapters=[]`` stores an empty list to mean "tried, got nothing".
+    - ``chapters=[Chapter(...), ...]`` serializes the list.
+
+    The row must already exist (the orchestrator writes the transcript first).
+    Silently no-ops if the row isn't there yet.
+    """
+    payload: list[dict[str, Any]] | None
+    if chapters is None:
+        payload = None
+    else:
+        payload = [_chapter_to_dict(c) for c in chapters]
+
+    stmt = (
+        Transcript.__table__.update()
+        .where(Transcript.video_id == video_id)
+        .where(Transcript.language == language)
+        .values(chapters_jsonb=payload)
+    )
+    await session.execute(stmt)
+
+
+async def put_diarization(
+    session: AsyncSession,
+    video_id: str,
+    language: str,
+    snippets: list[Snippet],
+    has_diarization: bool,
+) -> int:
+    """Partial-update ``snippets_jsonb`` + ``has_diarization`` only.
+
+    Used by the diarization worker after enrichment completes. Does not
+    touch ``chapters_jsonb``, ``full_text``, ``expires_at``, or ``fetched_at``.
+    Returns the affected rowcount so the caller can detect cases where the
+    target transcript was purged mid-flight (rowcount == 0).
+    """
+    snippets_payload = [_snippet_to_dict(s) for s in snippets]
+    stmt = (
+        Transcript.__table__.update()
+        .where(Transcript.video_id == video_id)
+        .where(Transcript.language == language)
+        .values(snippets_jsonb=snippets_payload, has_diarization=has_diarization)
+    )
+    result = await session.execute(stmt)
+    return int(result.rowcount or 0)
 
 
 async def purge_transcript(session: AsyncSession, video_id: str) -> int:
@@ -220,6 +315,8 @@ async def stats(session: AsyncSession) -> dict[str, Any]:
 __all__ = [
     "get_transcript",
     "put_transcript",
+    "put_chapters",
+    "put_diarization",
     "purge_transcript",
     "stats",
     "TranscriptSource",

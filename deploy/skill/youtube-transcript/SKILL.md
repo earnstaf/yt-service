@@ -63,13 +63,37 @@ In Phase 1, channel and playlist URLs return a structured error from the service
 
 ## Summary requests
 
-Phase 1 has no summary endpoint. `scripts/summarize.py` is a stub that explains this and exits 0. To summarize a Phase 1 video:
+`scripts/summarize.py` POSTs to `/v1/summarize` (P2+). The transcript must already be cached — call `fetch_transcript.py` first if unsure.
 
-1. Call `fetch_transcript.py` to get the full transcript JSON.
-2. Read the `full_text` field (and `snippets[]` for timestamped quotes).
-3. Generate the summary directly in the conversation using the returned text.
+```bash
+python scripts/summarize.py "<URL or ID>" --style exec_brief --audience "SE team"
+```
 
-Phase 2 will add `/v1/summarize` with styles (`exec_brief`, `exec_deep`, `bullet`, `narrative`, etc.), and `summarize.py` will call it.
+### Choosing a summary style
+
+Map the user's phrasing to a `--style` value:
+
+| User phrasing | `--style` |
+|---|---|
+| "exec summary" / "executive summary" / "brief" | `exec_brief` |
+| "deep dive" / "executive deep dive" / "detailed exec" | `exec_deep` |
+| "technical" / "engineering" / "implementation details" | `technical` |
+| "bullets" / "bulleted" / "list" | `bulleted` |
+| "competitive" / "compete" / "vs <competitor>" | `competitive_intel` |
+| User supplies a custom instruction | `custom` (use `--custom-prompt`) |
+| Anything else | `exec_brief` (safe default) |
+
+### Deep links in summary output
+
+The response includes `key_timestamps[]` with `{t, label, deep_link}`. Format quotes as `[label](deep_link)`:
+
+> "[Pricing announcement](https://youtu.be/OMhKgQmeMhI?t=412)"
+
+Never construct deep links by hand — use the server-supplied `deep_link` field.
+
+### Chapters and speakers (P2)
+
+Pass `--include chapters` to `fetch_transcript.py` to get `chapters[]` on the response. Pass `--include speakers` to enable diarization. Captions-sourced transcripts cannot be diarized (response carries `diarization_status: "captions_source_unsupported"`); use `--force whisper` first to re-transcribe. Whisper-sourced diarization runs async — response includes `diarization_status: "queued"` and `diarization_job_id`; poll the job and re-fetch the transcript when complete.
 
 ## Errors and never-leak rules
 

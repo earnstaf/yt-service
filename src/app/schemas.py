@@ -110,6 +110,11 @@ class TranscriptResponse(BaseModel):
     chapters: list[ChapterOut] | None = None
     snippets: list[TranscriptSnippetOut]
     full_text: str
+    # P2 enrichment status fields (JC-031): present only when include=speakers
+    # is requested and diarization isn't pre-computed.
+    diarization_status: Literal["queued", "captions_source_unsupported"] | None = None
+    diarization_job_id: str | None = None
+    has_diarization: bool | None = None
     # `kind` is the discriminator for the BatchResponseItem union. We exclude
     # it from the wire JSON (spec §5.5 examples do not include it) but keep
     # the field on the model so TypeAdapter / discriminated union validation
@@ -125,7 +130,7 @@ class TranscriptResponse(BaseModel):
 
 
 class JobAcceptedResponse(BaseModel):
-    """202 response for GET /v1/transcript (or batch item) when a Whisper job is queued/running."""
+    """202 response for GET /v1/transcript (or batch item) when a job is queued/running."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -134,6 +139,9 @@ class JobAcceptedResponse(BaseModel):
     video_id: str
     poll_url: str
     estimated_seconds: int
+    # P2: explicit job_type so polling clients can distinguish whisper vs
+    # enrichment jobs. Defaults to "whisper" for back-compat with P1 clients.
+    job_type: Literal["whisper", "enrichment"] = "whisper"
     kind: Literal["job_accepted"] = Field(default="job_accepted", exclude=True)
 
 
@@ -149,7 +157,16 @@ class JobStatusResponse(BaseModel):
 
     job_id: str
     video_id: str
-    job_type: Literal["captions", "whisper", "ingest", "summarize", "topics", "sentiment", "diff"]
+    job_type: Literal[
+        "captions",
+        "whisper",
+        "enrichment",
+        "ingest",
+        "summarize",
+        "topics",
+        "sentiment",
+        "diff",
+    ]
     status: Literal["queued", "running", "complete", "failed"]
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -266,6 +283,63 @@ class HealthResponse(BaseModel):
     checks: dict[str, str]
 
 
+# ---------------------------------------------------------------------------
+# /v1/summarize (P2)
+# ---------------------------------------------------------------------------
+
+
+_PROVIDER_OVERRIDE_RE = r"^(anthropic_direct|openai_direct|gemini_direct|llmapi)/[\w\-.]+$"
+
+
+class SummarizeRequest(BaseModel):
+    """POST /v1/summarize body per spec §5.5."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    style: Literal[
+        "exec_brief", "exec_deep", "technical", "bulleted", "competitive_intel", "custom"
+    ] = "exec_brief"
+    audience: str = ""
+    custom_prompt: str | None = None
+    max_tokens: int = 800
+    include_timestamps: bool = True
+    # Admin-only. The route enforces ``require_scopes("admin")`` when this is set.
+    provider_override: str | None = Field(default=None, pattern=_PROVIDER_OVERRIDE_RE)
+
+    @field_validator("max_tokens")
+    @classmethod
+    def _validate_max_tokens(cls, v: int) -> int:
+        if v < 1 or v > 8000:
+            raise ValueError("invalid_request: max_tokens must be in [1, 8000]")
+        return v
+
+
+class KeyTimestampOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    t: int
+    label: str
+    deep_link: str
+
+
+class SummarizeResponse(BaseModel):
+    """POST /v1/summarize response per spec §5.5."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    style: str
+    audience: str
+    summary: str
+    key_timestamps: list[KeyTimestampOut]
+    provider_used: str
+    tokens_in: int
+    tokens_out: int
+    cost_usd: float
+    cached: bool
+
+
 __all__ = [
     "TranscriptSnippetOut",
     "ChapterOut",
@@ -279,4 +353,7 @@ __all__ = [
     "CacheStatsResponse",
     "CachePurgeResponse",
     "HealthResponse",
+    "SummarizeRequest",
+    "SummarizeResponse",
+    "KeyTimestampOut",
 ]
