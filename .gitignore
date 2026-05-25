@@ -51,3 +51,6 @@ tmp/
 
 # Local transcript archive (YT_SERVICE_ARCHIVE_DIR target)
 local-archive/
+
+# Built skill bundles
+dist/
